@@ -2,16 +2,19 @@
     {
         "name": "RELIANCE.NS",
         "threshold_type": "EMA",
-        "threshold_number": 40
+        "threshold_number": 10,
+        "comparison": "gt"
     },
     {
         "name": "HDFCBANK.NS",
         "threshold_type": "PB",
-        "threshold_number": 10
+        "threshold_number": 2,
+        "comparison": "lt"
     },
     {
         "name": "TCS.NS",
         "threshold_type": "PE",
-        "threshold_number": 40
+        "threshold_number": 10,
+        "comparison": "gt"
     }
 ]

@@ -27,9 +27,12 @@ def read_stock_codes(json_file_path):
         with open(json_file_path, 'r') as file:
             data = json.load(file)
         if isinstance(data, list):
+            # Set default comparison to 'lt' if not specified
+            for stock in data:
+                stock['comparison'] = stock.get('comparison', 'lt')
             return data
         elif isinstance(data, dict) and 'stocks' in data:
-            return [{'name': ticker, 'threshold_type': None, 'threshold_number': None} for ticker in data['stocks']]
+            return [{'name': ticker, 'threshold_type': None, 'threshold_number': None, 'comparison': 'lt'} for ticker in data['stocks']]
         else:
             logger.error(f"Unexpected JSON structure in {json_file_path}")
             return []
@@ -43,8 +46,8 @@ def read_stock_codes(json_file_path):
         logger.error(f"Error reading JSON file: {str(e)}")
         return []
 
-def calculate_ema(ticker, period=20):
-    """Calculate EMA for a given stock ticker."""
+def calculate_ema(ticker, period=20, days_back=0):
+    """Calculate EMA for a given stock ticker, optionally for a past day."""
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period="60d")
@@ -52,10 +55,36 @@ def calculate_ema(ticker, period=20):
             logger.warning(f"No historical data for {ticker}")
             return None
         closes = hist['Close']
-        ema = closes.ewm(span=period, adjust=False).mean()[-1]
-        return round(ema, 2)
+        ema = closes.ewm(span=period, adjust=False).mean()
+        return round(ema[-1 - days_back], 2) if len(ema) > days_back else None
     except Exception as e:
         logger.error(f"Error calculating EMA for {ticker}: {str(e)}")
+        return None
+
+def get_previous_day_close(ticker):
+    """Get the previous day's closing price."""
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="2d")
+        if len(hist) < 2:
+            logger.warning(f"Insufficient historical data for {ticker}")
+            return None
+        return round(hist['Close'][-2], 2)  # Previous day's close
+    except Exception as e:
+        logger.error(f"Error fetching previous day close for {ticker}: {str(e)}")
+        return None
+
+def get_current_day_close(ticker):
+    """Get the current day's closing price."""
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="1d")
+        if hist.empty:
+            logger.warning(f"No historical data for {ticker}")
+            return None
+        return round(hist['Close'][-1], 2)  # Current day's close
+    except Exception as e:
+        logger.error(f"Error fetching current day close for {ticker}: {str(e)}")
         return None
 
 def get_ttm_pe_pb_ratio(ticker):
@@ -97,7 +126,6 @@ def get_ttm_pe_pb_ratio(ticker):
 
 async def calculate_pe_ratios(json_file_path, ema_period=20):
     """Calculate TTM P/E, P/B ratios, and EMA, check thresholds, and send alerts."""
-    # Get Telegram credentials
     bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
     chat_id = os.getenv('TELEGRAM_CHAT_ID')
     
@@ -114,6 +142,7 @@ async def calculate_pe_ratios(json_file_path, ema_period=20):
         ticker = stock.get('name')
         threshold_type = stock.get('threshold_type')
         threshold_number = float(stock.get('threshold_number', 0)) if stock.get('threshold_number') is not None else None
+        comparison = stock.get('comparison', 'lt')
         
         if not ticker:
             logger.warning(f"Invalid stock data: {stock}")
@@ -121,19 +150,27 @@ async def calculate_pe_ratios(json_file_path, ema_period=20):
 
         logger.info(f"Processing {ticker}")
         pe_ratio, calculated_pe_ratio, pb_ratio, calculated_pb_ratio, current_price, ttm_eps, book_value = get_ttm_pe_pb_ratio(ticker)
-        ema = calculate_ema(ticker, ema_period)
+        current_ema = calculate_ema(ticker, ema_period)
+        prev_day_close = get_previous_day_close(ticker)
+        current_day_close = get_current_day_close(ticker)
+        prev_day_ema = calculate_ema(ticker, ema_period, days_back=1)
 
         # Check thresholds and generate alerts
         alert_message = None
         if threshold_type == "PE" and calculated_pe_ratio is not None and threshold_number is not None:
-            if calculated_pe_ratio < threshold_number:
-                alert_message = f"ALERT: {ticker} P/E ratio ({calculated_pe_ratio}) is below threshold ({threshold_number})!"
-        elif threshold_type == "EMA" and ema is not None and threshold_number is not None:
-            if ema < threshold_number:
-                alert_message = f"ALERT: {ticker} EMA ({ema}) is below threshold ({threshold_number})!"
+            if (comparison == "lt" and calculated_pe_ratio < threshold_number) or \
+               (comparison == "gt" and calculated_pe_ratio > threshold_number):
+                alert_message = f"ALERT: {ticker} P/E ratio ({calculated_pe_ratio}) is {comparison} threshold ({threshold_number})!"
         elif threshold_type == "PB" and calculated_pb_ratio is not None and threshold_number is not None:
-            if calculated_pb_ratio < threshold_number:
-                alert_message = f"ALERT: {ticker} P/B ratio ({calculated_pb_ratio}) is below threshold ({threshold_number})!"
+            if (comparison == "lt" and calculated_pb_ratio < threshold_number) or \
+               (comparison == "gt" and calculated_pb_ratio > threshold_number):
+                alert_message = f"ALERT: {ticker} P/B ratio ({calculated_pb_ratio}) is {comparison} threshold ({threshold_number})!"
+        elif threshold_type == "EMA" and current_ema is not None and threshold_number is not None:
+            if comparison == "lt" and prev_day_close is not None and prev_day_ema is not None and current_day_close is not None:
+                if prev_day_close > current_day_close and prev_day_ema > current_ema:
+                    alert_message = f"ALERT: {ticker} EMA conditions met: Previous close ({prev_day_close}) > Current close ({current_day_close}), Previous EMA ({prev_day_ema}) > Current EMA ({current_ema})!"
+            elif comparison == "gt" and current_ema > threshold_number:
+                alert_message = f"ALERT: {ticker} EMA ({current_ema}) is above threshold ({threshold_number})!"
 
         # Send alert to Telegram and print
         if alert_message:
@@ -150,9 +187,13 @@ async def calculate_pe_ratios(json_file_path, ema_period=20):
             'book_value': book_value if book_value is not None else 'N/A',
             'pb_ratio': pb_ratio if pb_ratio is not None else 'N/A',
             'calculated_pb_ratio': calculated_pb_ratio if calculated_pb_ratio is not None else 'N/A',
-            'ema': ema if ema is not None else 'N/A',
+            'ema': current_ema if current_ema is not None else 'N/A',
+            'prev_day_close': prev_day_close if prev_day_close is not None else 'N/A',
+            'current_day_close': current_day_close if current_day_close is not None else 'N/A',
+            'prev_day_ema': prev_day_ema if prev_day_ema is not None else 'N/A',
             'threshold_type': threshold_type if threshold_type is not None else 'N/A',
-            'threshold_number': threshold_number if threshold_number is not None else 'N/A'
+            'threshold_number': threshold_number if threshold_number is not None else 'N/A',
+            'comparison': comparison
         })
 
     # Create DataFrame and save to CSV
@@ -166,7 +207,5 @@ async def calculate_pe_ratios(json_file_path, ema_period=20):
     print(df)
 
 if __name__ == "__main__":
-    # Example JSON file path
     json_file_path = 'nse_stocks.json'
-    # Run the async function
     asyncio.run(calculate_pe_ratios(json_file_path))
